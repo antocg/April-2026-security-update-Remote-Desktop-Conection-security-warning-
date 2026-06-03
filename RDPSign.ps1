@@ -8,9 +8,41 @@
 # "THE SCRIPT IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND..."
 # ==============================================================================
 
+param([switch]$Relaunched)
+
+# 0. Ensure we are running elevated.
+#    The certificate lives in Cert:\LocalMachine\My, whose private key is only
+#    accessible to Administrators. Without elevation rdpsign fails with
+#    NTE_BAD_KEYSET (0x80090016) and the file is left unsigned.
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "Administrator rights required. Relaunching elevated..." -ForegroundColor Yellow
+    $hostExe = (Get-Process -Id $PID).Path
+    Start-Process -FilePath $hostExe -Verb RunAs -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-Relaunched'
+    )
+    exit
+}
+
+# 0b. Resolve rdpsign.exe. On some editions (e.g. Windows 11 Home) it is staged
+#     only in the WinSxS component store and never projected into System32, so it
+#     is not on PATH. Fall back to the newest WinSxS copy when needed.
+function Resolve-RdpSign {
+    $cmd = Get-Command rdpsign.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+
+    $sys = Join-Path $env:windir 'System32\rdpsign.exe'
+    if (Test-Path $sys) { return $sys }
+
+    return Get-ChildItem (Join-Path $env:windir 'WinSxS') -Filter rdpsign.exe -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -ne 'r' } |
+        Sort-Object { $_.VersionInfo.FileVersionRaw } -Descending |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+
 # 1. Configuration
-$rdpFile = "C:\Users\Desktop\RDPFILENAME.rdp"
-$certSubjectName = "CompanyNameIT-RDP"
+$rdpFile = "C:\Users\Antoine\Desktop\lefosig.rdp"
+$certSubjectName = "UdeM-RDP"
 $certSubject = "CN=$certSubjectName"
 
 # 2. Check for existing certificate
@@ -69,10 +101,30 @@ if ($existingCert) {
 
 # 3. Sign the RDP File
 if (Test-Path $rdpFile) {
+    $rdpsignExe = Resolve-RdpSign
+    if (-not $rdpsignExe) {
+        Write-Error "rdpsign.exe was not found on this system. Cannot sign $rdpFile."
+        if ($Relaunched) { Read-Host "Press Enter to exit" }
+        exit 1
+    }
+
     Write-Host "Signing RDP file: $rdpFile" -ForegroundColor Cyan
+    Write-Host "Using rdpsign: $rdpsignExe" -ForegroundColor DarkGray
     # Signing with /sha256 to match modern security standards
-    rdpsign.exe /sha256 $thumbprint "$rdpFile"
-    Write-Host "Success! RDP file is ready for use." -ForegroundColor Green
+    & $rdpsignExe /sha256 $thumbprint "$rdpFile"
+
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Success! RDP file is signed and ready for use." -ForegroundColor Green
+    } else {
+        Write-Error ("rdpsign failed with exit code 0x{0:X8}. The RDP file was NOT signed." -f $LASTEXITCODE)
+        if ($Relaunched) { Read-Host "Press Enter to exit" }
+        exit 1
+    }
 } else {
     Write-Error "Target RDP file not found at $rdpFile"
+    if ($Relaunched) { Read-Host "Press Enter to exit" }
+    exit 1
 }
+
+# Keep the elevated window open so the result is readable before it closes.
+if ($Relaunched) { Read-Host "`nDone. Press Enter to exit" }
